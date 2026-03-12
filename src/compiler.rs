@@ -1,10 +1,10 @@
 use crate::parser::Expression;
 
-// represents all the chunks (functionsa nd global
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Chunk {
     pub ops: Vec<OpCode>,
     pub constants: Vec<f64>,
+    pub strings: Vec<String>, // string constants pool
     pub symbols: Vec<String>,
 }
 
@@ -26,32 +26,37 @@ pub enum CompilerError {
     InvalidArg,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum OpCode {
     Push,
     PushConst(usize), // const idx
+    PushStr(usize),   // string const idx
     Pop,
-    Load(usize), // load from symbol idx
+    Load(usize),
     LoadGlobal(usize),
     LoadLocal(usize),
     LoadUpvalue(usize),
     StoreGlobal(usize),
     StoreLocal(usize),
     StoreUpvalue(usize),
-    Store(usize), // store into symbol idx
-    Add(usize),   // aritiy
-    Mul(usize),   // aritiy
-    Sub(usize),   // aritiy
-    Div(usize),   // aritiy
-    Eq,           // aritiy
-    Lt,           // aritiy
-    Gt,           // aritiy
-    Lte,          // aritiy
-    Gte,          // aritiy
+    Store(usize),
+    Add(usize),
+    Mul(usize),
+    Sub(usize),
+    Div(usize),
+    Eq,
+    Lt,
+    Gt,
+    Lte,
+    Gte,
     MakeList(usize),
-    Call(usize),               // arity
-    MakeFunc(usize),           // defines function with fn chunk idx
-    MakeClosure(usize, usize), // chunk_idx + upvalues_len
+    Call(usize),
+    MakeFunc(usize),
+    MakeClosure(usize, usize),
+    Eval,              // pop a string, eval it in the current VM context, push result
+    PushKeyword(usize), // push Value::Keyword from strings pool
+    PushSymbol(usize),  // push Value::Symbol from strings pool (quoted symbol)
+    GetField(usize),    // pop a map, push map[strings[idx]]
     Return,
     Jump(usize),
     JumpIfFalse(usize),
@@ -67,18 +72,18 @@ pub struct Compiler {
 
 fn extract_function_definition(
     list: &[Expression],
-) -> Option<(Option<String>, Vec<Expression>, Vec<Expression>)> {
+) -> Option<(Option<String>, Vec<Expression>, Expression)> {
     match (list.first(), list.get(1), list.get(2), list.get(3)) {
         (
             Some(Expression::Symbol(s)),
             Some(Expression::Symbol(name)),
             Some(Expression::List(args)),
-            Some(Expression::List(body)),
+            Some(body),
         ) if s == "def" => Some((Some(name.to_string()), args.clone(), body.clone())),
         (
             Some(Expression::Symbol(s)),
             Some(Expression::List(args)),
-            Some(Expression::List(body)),
+            Some(body),
             _,
         ) if s == "lambda" => Some((None, args.clone(), body.clone())),
         _ => None,
@@ -107,6 +112,28 @@ impl Compiler {
         }
     }
 
+    /// For REPL/eval_str: start with existing chunks and global symbol table
+    /// so new code compiles against the same indices.
+    pub fn new_repl(
+        expressions: Vec<Expression>,
+        existing_chunks: Vec<Chunk>,
+        existing_global_names: Vec<String>,
+    ) -> Self {
+        Compiler {
+            expressions,
+            chunks: existing_chunks,
+            scopes: vec![],
+            current_chunk: 0,
+            global_symbols: existing_global_names,
+        }
+    }
+
+    /// Consume the compiler and return the final global symbol table,
+    /// so the VM can sync its own name→index mapping.
+    pub fn into_global_names(self) -> Vec<String> {
+        self.global_symbols
+    }
+
     fn chunk(&self) -> Option<&Chunk> {
         self.chunks.get(self.current_chunk)
     }
@@ -125,13 +152,13 @@ impl Compiler {
         idx
     }
 
-    fn use_symbol(&mut self, symbol: String) -> usize {
+    fn use_string_constant(&mut self, s: &str) -> usize {
         let chunk = self.chunk_mut().unwrap();
-        if let Some(index) = chunk.symbols.iter().position(|r| *r == symbol) {
+        if let Some(index) = chunk.strings.iter().position(|r| r == s) {
             return index;
         }
-        let idx = chunk.symbols.len();
-        chunk.symbols.push(symbol);
+        let idx = chunk.strings.len();
+        chunk.strings.push(s.to_string());
         idx
     }
 
@@ -157,7 +184,6 @@ impl Compiler {
             return SymbolResolution::Upvalue(upvalues_idx);
         }
 
-        // global
         let idx = self.use_global(name);
         SymbolResolution::Global(idx)
     }
@@ -211,7 +237,7 @@ impl Compiler {
         &mut self,
         name: Option<String>,
         args: Vec<Expression>,
-        body: Vec<Expression>,
+        body: Expression,
     ) -> Result<(), CompilerError> {
         let symbols: Vec<String> = args
             .iter()
@@ -226,20 +252,15 @@ impl Compiler {
         let (new_chunk_idx, previous_chunk_idx) = self.new_chunk(Chunk {
             ops: vec![],
             constants: vec![],
+            strings: vec![],
             symbols,
         });
-        self.compile_list(&body)?;
+        self.compile_expression(&body)?;
 
-        // finished compiling body, pop the scope to collect upvalues to pass to closure
         let scope = self.scopes.pop().unwrap();
-
         self.emit(OpCode::Return);
-
-        // bring back original chunk
         self.current_chunk = previous_chunk_idx;
 
-        // the magic of closures -> loop thru upvalues generated in function definition (at
-        // compile time) and "load them" so that they get placed on the VM stack
         for upvalue_name in &scope.upvalues {
             let resolved = self.resolve_symbol(upvalue_name);
             match resolved {
@@ -250,7 +271,6 @@ impl Compiler {
         }
         self.emit(OpCode::MakeClosure(new_chunk_idx, scope.upvalues.len()));
         if let Some(name) = name {
-            // is named function
             self.emit_symbol_store(&name);
         }
 
@@ -291,6 +311,15 @@ impl Compiler {
             return self.compile_if_statement(cond, then_body, else_body);
         }
 
+        // (eval expr) — compile expr to produce a string, then evaluate it at runtime
+        if let (Some(Expression::Symbol(s)), Some(expr), 2) = (list.first(), list.get(1), list.len()) {
+            if s == "eval" {
+                self.compile_expression(expr)?;
+                self.emit(OpCode::Eval);
+                return Ok(());
+            }
+        }
+
         let op = list.first();
 
         if let Some(op) = op {
@@ -300,15 +329,32 @@ impl Compiler {
                         let constant_idx = self.use_constant(*c);
                         self.emit(OpCode::PushConst(constant_idx));
                     }
+                    Expression::String(s) => {
+                        let str_idx = self.use_string_constant(s);
+                        self.emit(OpCode::PushStr(str_idx));
+                    }
                     Expression::Symbol(c) => match op {
                         Expression::Symbol(s) if s == "def" && i == 0 => continue,
                         _ => {
-                            self.emit_symbol_load(c);
+                            self.compile_expression(&Expression::Symbol(c.clone()))?;
                         }
                     },
                     Expression::List(l) => {
-                        // (def sq (x) (* x x)) -> in this case we need to define a function
                         self.compile_list(l)?;
+                    }
+                    Expression::Keyword(k) => {
+                        let idx = self.use_string_constant(k);
+                        self.emit(OpCode::PushKeyword(idx));
+                    }
+                    Expression::QuoteSymbol(s) => {
+                        let idx = self.use_string_constant(s);
+                        self.emit(OpCode::PushSymbol(idx));
+                    }
+                    Expression::QuoteList(items) => {
+                        for item in items {
+                            self.compile_expression(item)?;
+                        }
+                        self.emit(OpCode::MakeList(items.len()));
                     }
                     _ => {}
                 }
@@ -327,13 +373,10 @@ impl Compiler {
                 Expression::Symbol(s) if s == ">=" => self.emit(OpCode::Gte),
                 Expression::Symbol(s) if s == "def" => {
                     if let Some(Expression::Symbol(s)) = list.get(1) {
-                        // builtin def eg: (def x 5)
                         self.emit_symbol_store(s);
                     }
                 }
                 _ => {
-                    // TODO - add other builtins before doing CALL
-                    // Handle function call
                     self.compile_expression(op)?;
                     self.emit(OpCode::Call(arity));
                 }
@@ -348,16 +391,42 @@ impl Compiler {
                 self.compile_list(l)?;
             }
             Expression::Symbol(s) => {
-                self.emit_symbol_load(s);
+                // Dot syntax: person.age  →  load person, GetField("age")
+                // person.address.city  →  load person, GetField("address"), GetField("city")
+                let parts: Vec<&str> = s.splitn(2, '.').collect();
+                if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                    self.emit_symbol_load(parts[0]);
+                    // Chain remaining fields (handles a.b.c via recursion of the rest)
+                    for field in parts[1].split('.') {
+                        let idx = self.use_string_constant(field);
+                        self.emit(OpCode::GetField(idx));
+                    }
+                } else {
+                    self.emit_symbol_load(s);
+                }
+            }
+            Expression::Keyword(s) => {
+                let idx = self.use_string_constant(s);
+                self.emit(OpCode::PushKeyword(idx));
             }
             Expression::Number(n) => {
                 let constant_idx = self.use_constant(*n);
-                self.chunk_mut()
-                    .unwrap()
-                    .ops
-                    .push(OpCode::PushConst(constant_idx));
+                self.chunk_mut().unwrap().ops.push(OpCode::PushConst(constant_idx));
             }
-            _ => {}
+            Expression::String(s) => {
+                let str_idx = self.use_string_constant(s);
+                self.emit(OpCode::PushStr(str_idx));
+            }
+            Expression::QuoteSymbol(s) => {
+                let idx = self.use_string_constant(s);
+                self.emit(OpCode::PushSymbol(idx));
+            }
+            Expression::QuoteList(items) => {
+                for item in items {
+                    self.compile_expression(item)?;
+                }
+                self.emit(OpCode::MakeList(items.len()));
+            }
         }
 
         Ok(())
@@ -367,6 +436,7 @@ impl Compiler {
         _ = self.new_chunk(Chunk {
             ops: vec![],
             constants: vec![],
+            strings: vec![],
             symbols: vec![],
         });
         let expressions = std::mem::take(&mut self.expressions);

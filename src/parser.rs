@@ -19,6 +19,7 @@ pub enum Token {
     RightParen,
     Pipe,
     Symbol(String),
+    Keyword(String), // :foo
     Number(f64),
     String(String),
     Quote,
@@ -127,13 +128,26 @@ impl Parser {
                         tokens.push(self.parse_string()?);
                         self.next();
                     }
+                    ';' => {
+                        // Skip comment to end of line
+                        while matches!(self.peek(), Some(c) if c != '\n') {
+                            self.next();
+                        }
+                    }
+                    ':' => {
+                        self.next(); // consume ':'
+                        let Token::Symbol(name) = self.parse_symbol()? else {
+                            unreachable!()
+                        };
+                        tokens.push(Token::Keyword(name));
+                    }
                     _ if next.is_alphabetic() || next.is_ascii_punctuation() => {
                         tokens.push(self.parse_symbol()?);
                     }
                     _ if next.is_numeric() => {
                         tokens.push(self.parse_number()?);
                     }
-                    _ => {}
+                    _ => { self.next(); } // skip unknown chars (e.g. unicode outside strings)
                 }
             }
         }
@@ -144,6 +158,7 @@ impl Parser {
 #[derive(Debug, Clone)]
 pub enum Expression {
     Symbol(String),
+    Keyword(String), // :foo
     String(String),
     QuoteSymbol(String),
     QuoteList(Vec<Expression>),
@@ -194,6 +209,7 @@ impl ASTParser {
             Some(Token::Pipe) => Err(ParserError::InvalidQuote),
             Some(Token::Quote) => Err(ParserError::InvalidQuote),
             Some(Token::String(_)) => Err(ParserError::InvalidQuote),
+            Some(Token::Keyword(_)) => Err(ParserError::InvalidQuote),
             Some(Token::Symbol(s)) => {
                 let expression = Expression::QuoteSymbol(s.to_string());
                 self.next();
@@ -254,6 +270,11 @@ impl ASTParser {
                 let value = s.to_string();
                 self.next();
                 Ok(Expression::Symbol(value))
+            }
+            Some(Token::Keyword(k)) => {
+                let value = k.to_string();
+                self.next();
+                Ok(Expression::Keyword(value))
             }
             Some(Token::Pipe) => self.parse_lambda_shorthand(),
             Some(Token::RightParen) => Err(ParserError::ExpectedLeftParen),

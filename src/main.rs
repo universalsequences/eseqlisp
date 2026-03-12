@@ -1,30 +1,64 @@
+mod buffer;
 mod compiler;
+mod editor;
 mod parser;
+mod text;
+mod tui;
 mod vm;
+
+use crossterm::event::{self, Event};
+use ratatui::DefaultTerminal;
+use std::{io, time::Duration};
 
 use compiler::Compiler;
 use parser::{ASTParser, Parser};
-use vm::VM;
+use vm::{VM, VMError, Value, register_core_natives};
 
-use crate::{vm::VMError, vm::Value};
-
+#[allow(dead_code)]
 fn run_prog(prog: &str) -> Result<Option<Value>, VMError> {
-    let mut parser = Parser::new(prog.to_string());
-
-    if let Ok(tokens) = parser.parse() {
-        let mut ast = ASTParser::new(tokens);
-        if let Ok(expressions) = ast.parse() {
-            let mut compiler = Compiler::new(expressions);
-            if let Ok(chunks) = compiler.compile() {
-                let mut vm = VM::new(chunks);
-                return vm.execute();
-            }
-        }
-    }
-    Ok(None)
+    let mut vm = VM::new(vec![]);
+    register_core_natives(&mut vm);
+    vm.eval_str(prog)
 }
 
-fn main() {}
+fn run_editor(terminal: &mut DefaultTerminal) -> io::Result<()> {
+    let mut editor = editor::Editor::new();
+
+    loop {
+        // Poll for input with a short timeout so we could fire timers later.
+        if event::poll(Duration::from_millis(16))? {
+            match event::read()? {
+                Event::Key(key) => editor.handle_key(key),
+                Event::Resize(_, _) => editor.needs_redraw = true,
+                _ => {}
+            }
+        }
+
+        if editor.needs_redraw {
+            terminal.draw(|frame| tui::render(frame, &mut editor))?;
+            editor.needs_redraw = false;
+        }
+
+        if editor.should_quit {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
+    // Ensure the terminal is restored even if the editor panics (e.g. todo!())
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        default_hook(info);
+    }));
+
+    let mut terminal = ratatui::init();
+    let result = run_editor(&mut terminal);
+    ratatui::restore();
+    result
+}
 
 #[cfg(test)]
 mod tests {
@@ -98,6 +132,50 @@ mod tests {
         assert_eq!(
             run_prog("(def gauss (n) (if (= n 0) 0 (+ n (gauss (- n 1))))) (gauss 5)"),
             Ok(Some(Value::Number(15.0)))
+        );
+    }
+
+    #[test]
+    fn test_dict_get() {
+        assert_eq!(
+            run_prog("(def p (dict :name \"Alec\" :age 25)) (get p :age)"),
+            Ok(Some(Value::Number(25.0)))
+        );
+    }
+
+    #[test]
+    fn test_merge() {
+        assert_eq!(
+            run_prog("(def p (dict :age 25)) (def p2 (merge p :age 30)) (get p2 :age)"),
+            Ok(Some(Value::Number(30.0)))
+        );
+    }
+
+    #[test]
+    fn test_dot_syntax() {
+        assert_eq!(
+            run_prog("(def p (dict :age 25)) p.age"),
+            Ok(Some(Value::Number(25.0)))
+        );
+    }
+
+    #[test]
+    fn test_quote_symbol() {
+        assert_eq!(
+            run_prog("'hello"),
+            Ok(Some(Value::Symbol("hello".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_quote_list() {
+        assert_eq!(
+            run_prog("'(1 2 3)"),
+            Ok(Some(Value::List(vec![
+                std::rc::Rc::new(std::cell::RefCell::new(Value::Number(1.0))),
+                std::rc::Rc::new(std::cell::RefCell::new(Value::Number(2.0))),
+                std::rc::Rc::new(std::cell::RefCell::new(Value::Number(3.0))),
+            ])))
         );
     }
 }
