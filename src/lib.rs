@@ -2,6 +2,7 @@ pub mod buffer;
 pub mod compiler;
 pub mod editor;
 pub mod host;
+pub mod mode;
 pub mod parser;
 pub mod runtime;
 pub mod text;
@@ -17,7 +18,8 @@ use vm::{VMError, Value};
 
 pub use editor::{Editor, EditorConfig, EditorError, EditorExit};
 pub use host::{BufferId, CompileKind, HostCommand, HostEvent};
-pub use runtime::{NativeContext, NativeResult, Runtime, RuntimeError};
+pub use mode::BufferMode;
+pub use runtime::{NativeContext, NativeResult, Runtime, RuntimeError, SymbolMetadata};
 
 #[allow(dead_code)]
 pub fn run_prog(prog: &str) -> Result<Option<Value>, VMError> {
@@ -286,6 +288,17 @@ mod tests {
             panic!("expected number");
         };
         assert!((10.0..20.0).contains(&n), "rand-int returned {n}");
+    }
+
+    #[test]
+    fn test_division_inside_zero_arg_function_call() {
+        let value = run_prog("(def myrand () (/ (rand-int 100) 100)) (myrand)")
+            .unwrap()
+            .unwrap();
+        let Value::Number(n) = value else {
+            panic!("expected number");
+        };
+        assert!((0.0..1.0).contains(&n) || (n - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

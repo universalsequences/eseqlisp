@@ -203,6 +203,47 @@ pub fn follow_parens(parser: &mut SExpParser) -> String {
 ///   - From that '(', scan forwards to the matching ')'.
 ///   - Return the substring from '(' to ')' inclusive.
 pub fn sexp_at_cursor(lines: &[String], cursor: (usize, usize)) -> Option<String> {
+    let (start, end) = sexp_range_at_cursor(lines, cursor)?;
+
+    let mut flat = String::new();
+    let mut line_starts = Vec::with_capacity(lines.len());
+    for (idx, line) in lines.iter().enumerate() {
+        line_starts.push(flat.len());
+        flat.push_str(line);
+        if idx + 1 < lines.len() {
+            flat.push('\n');
+        }
+    }
+
+    let start_idx = line_starts[start.0] + start.1;
+    let end_idx = line_starts[end.0] + end.1;
+    Some(flat[start_idx..=end_idx].replace('\n', ""))
+}
+
+pub fn sexp_range_at_cursor(
+    lines: &[String],
+    cursor: (usize, usize),
+) -> Option<((usize, usize), (usize, usize))> {
+    sexp_range_at_cursor_with_selector(lines, cursor, RangeSelector::Outermost)
+}
+
+pub fn innermost_sexp_range_at_cursor(
+    lines: &[String],
+    cursor: (usize, usize),
+) -> Option<((usize, usize), (usize, usize))> {
+    sexp_range_at_cursor_with_selector(lines, cursor, RangeSelector::Innermost)
+}
+
+enum RangeSelector {
+    Outermost,
+    Innermost,
+}
+
+fn sexp_range_at_cursor_with_selector(
+    lines: &[String],
+    cursor: (usize, usize),
+    selector: RangeSelector,
+) -> Option<((usize, usize), (usize, usize))> {
     let line = lines.get(cursor.0)?;
     let cursor_col = cursor.1.min(line.len());
 
@@ -242,24 +283,32 @@ pub fn sexp_at_cursor(lines: &[String], cursor: (usize, usize)) -> Option<String
     } else if cursor_idx > 0 && bytes[cursor_idx - 1] == b')' {
         pairs.iter().find(|(_, close)| *close == cursor_idx - 1).copied()
     } else {
-        pairs.iter()
-            .filter(|(open, close)| *open < cursor_idx && cursor_idx <= *close)
-            .min_by_key(|(open, _)| *open)
-            .copied()
-            .or_else(|| {
-                pairs.iter()
-                    .filter(|(_, close)| *close < cursor_idx)
-                    .max_by_key(|(_, close)| *close)
-                    .copied()
-            })
+        let enclosing = pairs.iter().filter(|(open, close)| *open < cursor_idx && cursor_idx <= *close);
+        match selector {
+            RangeSelector::Outermost => enclosing.min_by_key(|(open, _)| *open).copied(),
+            RangeSelector::Innermost => enclosing.max_by_key(|(open, _)| *open).copied(),
+        }
+        .or_else(|| {
+            pairs.iter()
+                .filter(|(_, close)| *close < cursor_idx)
+                .max_by_key(|(_, close)| *close)
+                .copied()
+        })
     }?;
 
-    Some(flat[pair.0..=pair.1].replace('\n', ""))
+    Some((flat_index_to_cursor(&line_starts, pair.0), flat_index_to_cursor(&line_starts, pair.1)))
+}
+
+fn flat_index_to_cursor(line_starts: &[usize], idx: usize) -> (usize, usize) {
+    let row = line_starts
+        .partition_point(|start| *start <= idx)
+        .saturating_sub(1);
+    (row, idx.saturating_sub(line_starts[row]))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{matching_paren, sexp_at_cursor};
+    use super::{innermost_sexp_range_at_cursor, matching_paren, sexp_at_cursor, sexp_range_at_cursor};
 
     #[test]
     fn test_sexp_at_cursor() {
@@ -315,5 +364,19 @@ mod tests {
     fn matching_paren_finds_real_match_for_open() {
         let lines = ["(a".to_string(), ")".to_string()];
         assert_eq!(matching_paren(&lines, (0, 0)), Some((1, 0)));
+    }
+
+    #[test]
+    fn sexp_range_returns_enclosing_form_bounds() {
+        let lines = ["(if (< (rand-int 8) 4) :4t :32))".to_string()];
+        let range = sexp_range_at_cursor(&lines, (0, 21)).unwrap();
+        assert_eq!(range, ((0, 0), (0, 30)));
+    }
+
+    #[test]
+    fn innermost_sexp_range_returns_current_nested_form_bounds() {
+        let lines = ["(if (< (rand-int 8) 4) :4t :32))".to_string()];
+        let range = innermost_sexp_range_at_cursor(&lines, (0, 21)).unwrap();
+        assert_eq!(range, ((0, 4), (0, 21)));
     }
 }

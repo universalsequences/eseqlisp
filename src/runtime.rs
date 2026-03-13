@@ -9,6 +9,12 @@ use crate::vm::{VM, Value, register_core_natives};
 pub type RuntimeError = String;
 pub type NativeResult = Result<Value, RuntimeError>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolMetadata {
+    pub signature: String,
+    pub docs: String,
+}
+
 #[derive(Default)]
 pub(crate) struct RuntimeBridgeState {
     pub current_buffer_id: Option<BufferId>,
@@ -78,6 +84,7 @@ impl NativeContext {
 pub struct Runtime {
     vm: VM,
     pub(crate) shared: SharedBridgeState,
+    symbol_metadata: HashMap<String, SymbolMetadata>,
 }
 
 impl Runtime {
@@ -85,7 +92,11 @@ impl Runtime {
         let shared = Rc::new(RefCell::new(RuntimeBridgeState::default()));
         let mut vm = VM::new(vec![]);
         register_core_natives(&mut vm);
-        Self { vm, shared }
+        Self {
+            vm,
+            shared,
+            symbol_metadata: HashMap::new(),
+        }
     }
 
     pub fn with_init_source(init: impl AsRef<str>) -> Self {
@@ -101,6 +112,30 @@ impl Runtime {
     where
         F: Fn(Vec<Value>, &mut NativeContext) -> NativeResult + 'static,
     {
+        self.register_native_impl(name, None, None, f);
+    }
+
+    pub fn register_native_with_docs<F>(
+        &mut self,
+        name: &str,
+        signature: impl Into<String>,
+        docs: impl Into<String>,
+        f: F,
+    ) where
+        F: Fn(Vec<Value>, &mut NativeContext) -> NativeResult + 'static,
+    {
+        self.register_native_impl(name, Some(signature.into()), Some(docs.into()), f);
+    }
+
+    fn register_native_impl<F>(
+        &mut self,
+        name: &str,
+        signature: Option<String>,
+        docs: Option<String>,
+        f: F,
+    ) where
+        F: Fn(Vec<Value>, &mut NativeContext) -> NativeResult + 'static,
+    {
         let shared = self.shared.clone();
         self.vm.register_native(name, move |args| {
             let mut ctx = NativeContext::new(shared.clone());
@@ -112,6 +147,10 @@ impl Runtime {
                 }
             }
         });
+        if let (Some(signature), Some(docs)) = (signature, docs) {
+            self.symbol_metadata
+                .insert(name.to_string(), SymbolMetadata { signature, docs });
+        }
     }
 
     pub fn eval_str(&mut self, src: &str) -> Result<Option<Value>, crate::vm::VMError> {
@@ -120,6 +159,14 @@ impl Runtime {
 
     pub fn set_global_value(&mut self, name: &str, value: Value) {
         self.vm.set_global_value(name, value);
+    }
+
+    pub fn global_names(&self) -> &[String] {
+        self.vm.global_names()
+    }
+
+    pub fn symbol_metadata(&self) -> &HashMap<String, SymbolMetadata> {
+        &self.symbol_metadata
     }
 
     pub fn take_status_message(&mut self) -> Option<String> {

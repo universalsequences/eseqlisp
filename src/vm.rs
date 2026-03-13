@@ -10,10 +10,12 @@ static RAND_STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 #[derive(Debug, PartialEq)]
 pub enum VMError {
     UnknownConstant,
+    UnknownOpcode,
     StackUnderflow,
     IncorrectType,
     UnknownVariable,
     ExpectedFunction,
+    ArityMismatch,
     ParseError,
     CompileError,
 }
@@ -445,6 +447,10 @@ impl VM {
         self.globals[idx] = Some(Rc::new(RefCell::new(value)));
     }
 
+    pub fn global_names(&self) -> &[String] {
+        &self.global_names
+    }
+
     fn execute_from(&mut self, entry_chunk: usize) -> Result<Option<Value>, VMError> {
         self.current_chunk = entry_chunk;
         self.execute()
@@ -542,6 +548,60 @@ impl VM {
                         }
                     }
                     stack.push(Rc::new(RefCell::new(Value::Number(product))));
+                    frames.last_mut().unwrap().pc += 1;
+                }
+                OpCode::Div(arity) => {
+                    if stack.len() < arity || arity == 0 {
+                        return Err(VMError::StackUnderflow);
+                    }
+                    let mut nums: Vec<f64> = vec![];
+                    for _ in 0..arity {
+                        if let Some(val) = stack.pop() {
+                            match *val.borrow() {
+                                Value::Number(val) => nums.push(val),
+                                _ => return Err(VMError::IncorrectType),
+                            }
+                        }
+                    }
+                    nums.reverse();
+                    let quotient = if nums.len() == 1 {
+                        1.0 / nums[0]
+                    } else {
+                        nums[1..].iter().fold(nums[0], |acc, x| acc / x)
+                    };
+                    stack.push(Rc::new(RefCell::new(Value::Number(quotient))));
+                    frames.last_mut().unwrap().pc += 1;
+                }
+                OpCode::Min(arity) => {
+                    if stack.len() < arity || arity == 0 {
+                        return Err(VMError::StackUnderflow);
+                    }
+                    let mut current = f64::INFINITY;
+                    for _ in 0..arity {
+                        if let Some(val) = stack.pop() {
+                            match *val.borrow() {
+                                Value::Number(val) => current = current.min(val),
+                                _ => return Err(VMError::IncorrectType),
+                            }
+                        }
+                    }
+                    stack.push(Rc::new(RefCell::new(Value::Number(current))));
+                    frames.last_mut().unwrap().pc += 1;
+                }
+                OpCode::Max(arity) => {
+                    if stack.len() < arity || arity == 0 {
+                        return Err(VMError::StackUnderflow);
+                    }
+                    let mut current = f64::NEG_INFINITY;
+                    for _ in 0..arity {
+                        if let Some(val) = stack.pop() {
+                            match *val.borrow() {
+                                Value::Number(val) => current = current.max(val),
+                                _ => return Err(VMError::IncorrectType),
+                            }
+                        }
+                    }
+                    stack.push(Rc::new(RefCell::new(Value::Number(current))));
                     frames.last_mut().unwrap().pc += 1;
                 }
                 OpCode::Pop => {
@@ -693,8 +753,18 @@ impl VM {
                                 self.current_chunk = chunk_idx;
                                 let mut frame = self.new_frame();
                                 frame.upvalues = upvalues;
+                                if arity > frame.locals.len() {
+                                    return Err(VMError::ArityMismatch);
+                                }
+                                if stack.len() < arity {
+                                    return Err(VMError::StackUnderflow);
+                                }
                                 for i in 0..arity {
-                                    frame.locals[arity - i - 1] = stack.pop();
+                                    let local_idx = arity - i - 1;
+                                    let Some(slot) = frame.locals.get_mut(local_idx) else {
+                                        return Err(VMError::ArityMismatch);
+                                    };
+                                    *slot = stack.pop();
                                 }
                                 frames.last_mut().unwrap().pc += 1;
                                 frames.push(frame);
@@ -788,7 +858,7 @@ impl VM {
                     }
                     None => return Err(VMError::StackUnderflow),
                 },
-                _ => {}
+                _ => return Err(VMError::UnknownOpcode),
             }
         }
 
