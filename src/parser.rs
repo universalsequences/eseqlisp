@@ -43,6 +43,10 @@ impl Parser {
         next
     }
 
+    fn peek_nth(&self, offset: usize) -> Option<char> {
+        self.text.chars().nth(self.pos + offset)
+    }
+
     fn parse_text(
         &mut self,
         stop_at_whitespace: bool,
@@ -89,7 +93,29 @@ impl Parser {
     }
 
     fn parse_number(&mut self) -> Result<Token, ParserError> {
-        let text = self.parse_text(true, None, true)?;
+        let mut text = String::new();
+        if matches!(self.peek(), Some('-')) {
+            text.push('-');
+            self.next();
+        }
+        let mut saw_digit = false;
+        let mut saw_dot = false;
+        while let Some(ch) = self.peek() {
+            if ch.is_ascii_digit() {
+                saw_digit = true;
+                text.push(ch);
+                self.next();
+            } else if ch == '.' && !saw_dot {
+                saw_dot = true;
+                text.push(ch);
+                self.next();
+            } else {
+                break;
+            }
+        }
+        if !saw_digit {
+            return Err(ParserError::ErrorParsingNumber);
+        }
         Ok(Token::Number(
             text.parse().map_err(|_| ParserError::ErrorParsingNumber)?,
         ))
@@ -144,7 +170,10 @@ impl Parser {
                     _ if next.is_alphabetic() || next.is_ascii_punctuation() => {
                         tokens.push(self.parse_symbol()?);
                     }
-                    _ if next.is_numeric() => {
+                    _ if next.is_ascii_digit()
+                        || (next == '-' && matches!(self.peek_nth(1), Some(ch) if ch.is_ascii_digit()))
+                        || (next == '.' && matches!(self.peek_nth(1), Some(ch) if ch.is_ascii_digit())) =>
+                    {
                         tokens.push(self.parse_number()?);
                     }
                     _ => { self.next(); } // skip unknown chars (e.g. unicode outside strings)

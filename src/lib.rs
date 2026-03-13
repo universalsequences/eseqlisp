@@ -1,0 +1,342 @@
+pub mod buffer;
+pub mod compiler;
+pub mod editor;
+pub mod host;
+pub mod parser;
+pub mod runtime;
+pub mod text;
+pub mod tui;
+pub mod vm;
+
+use std::{io, time::Duration};
+
+use crossterm::event::{self, Event};
+use ratatui::DefaultTerminal;
+
+use vm::{VMError, Value};
+
+pub use editor::{Editor, EditorConfig, EditorError, EditorExit};
+pub use host::{BufferId, CompileKind, HostCommand, HostEvent};
+pub use runtime::{NativeContext, NativeResult, Runtime, RuntimeError};
+
+#[allow(dead_code)]
+pub fn run_prog(prog: &str) -> Result<Option<Value>, VMError> {
+    let mut runtime = Runtime::new();
+    runtime.eval_str(prog)
+}
+
+pub fn run_editor(terminal: &mut DefaultTerminal) -> io::Result<()> {
+    let init_src = std::fs::read_to_string("init.lisp").unwrap_or_default();
+    let runtime = Runtime::new();
+    let mut editor = Editor::new(
+        runtime,
+        EditorConfig {
+            init_source: Some(init_src),
+        },
+    );
+
+    loop {
+        if event::poll(Duration::from_millis(16))? {
+            match event::read()? {
+                Event::Key(key) => editor.handle_key(key),
+                Event::Resize(_, _) => editor.mark_needs_redraw(),
+                _ => {}
+            }
+        }
+
+        if editor.needs_redraw() {
+            terminal.draw(|frame| tui::render(frame, &mut editor))?;
+            editor.clear_needs_redraw();
+        }
+
+        if editor.should_quit() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+pub fn run_standalone() -> io::Result<()> {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        default_hook(info);
+    }));
+
+    let mut terminal = ratatui::init();
+    let result = run_editor(&mut terminal);
+    ratatui::restore();
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Value, run_prog};
+    use crate::vm::{format_lisp_source, format_lisp_value};
+
+    #[test]
+    fn test_basic_sum() {
+        assert_eq!(run_prog("(+ 1 2)"), Ok(Some(Value::Number(3.0))));
+    }
+
+    #[test]
+    fn test_decimal_literal() {
+        assert_eq!(run_prog("0.25"), Ok(Some(Value::Number(0.25))));
+    }
+
+    #[test]
+    fn test_var_set() {
+        assert_eq!(
+            run_prog("(def x 5) (* x 10)"),
+            Ok(Some(Value::Number(50.0)))
+        );
+    }
+
+    #[test]
+    fn test_function_def() {
+        assert_eq!(
+            run_prog("(def sq (x) (* x x)) (sq 10)"),
+            Ok(Some(Value::Number(100.0)))
+        );
+    }
+
+    #[test]
+    fn test_multi_expression_function_body() {
+        assert_eq!(
+            run_prog("(def f () 1 2 3) (f)"),
+            Ok(Some(Value::Number(3.0)))
+        );
+    }
+
+    #[test]
+    fn test_function_closure() {
+        assert_eq!(
+            run_prog(
+                "(def sq (x) (* x x)) (def make-fn (fn a) (lambda (y) (fn (+ a y)))) ((make-fn sq 2) 10)"
+            ),
+            Ok(Some(Value::Number(144.0)))
+        );
+    }
+
+    #[test]
+    fn test_lambda_shorthand_as_argument() {
+        assert_eq!(
+            run_prog("(def use-fn (val fn) (fn val)) (use-fn 5 |x| (+ x 1))"),
+            Ok(Some(Value::Number(6.0)))
+        );
+    }
+
+    #[test]
+    fn test_lambda_shorthand_with_multiple_args() {
+        assert_eq!(
+            run_prog("(def use-fn (a b fn) (fn a b)) (use-fn 5 7 |x y| (+ x y))"),
+            Ok(Some(Value::Number(12.0)))
+        );
+    }
+
+    #[test]
+    fn test_if_statement_false() {
+        assert_eq!(
+            run_prog("(if (= 5 4) 10 15)"),
+            Ok(Some(Value::Number(15.0)))
+        );
+    }
+
+    #[test]
+    fn test_if_statement_true() {
+        assert_eq!(
+            run_prog("(if (= 5 5) 10 15)"),
+            Ok(Some(Value::Number(10.0)))
+        );
+    }
+
+    #[test]
+    fn test_recursion() {
+        assert_eq!(
+            run_prog("(def gauss (n) (if (= n 0) 0 (+ n (gauss (- n 1))))) (gauss 5)"),
+            Ok(Some(Value::Number(15.0)))
+        );
+    }
+
+    #[test]
+    fn test_let_expression() {
+        assert_eq!(
+            run_prog("(let ((a 2) (b 5)) (+ a b))"),
+            Ok(Some(Value::Number(7.0)))
+        );
+    }
+
+    #[test]
+    fn test_do_expression() {
+        assert_eq!(
+            run_prog("(do 1 2 3)"),
+            Ok(Some(Value::Number(3.0)))
+        );
+    }
+
+    #[test]
+    fn test_dict_get() {
+        assert_eq!(
+            run_prog("(def p (dict :name \"Alec\" :age 25)) (get p :age)"),
+            Ok(Some(Value::Number(25.0)))
+        );
+    }
+
+    #[test]
+    fn test_merge() {
+        assert_eq!(
+            run_prog("(def p (dict :age 25)) (def p2 (merge p :age 30)) (get p2 :age)"),
+            Ok(Some(Value::Number(30.0)))
+        );
+    }
+
+    #[test]
+    fn test_nil_literal_and_truthiness() {
+        assert_eq!(run_prog("nil"), Ok(Some(Value::Nil)));
+        assert_eq!(
+            run_prog("(if nil 10 20)"),
+            Ok(Some(Value::Number(20.0)))
+        );
+        assert_eq!(run_prog("(not nil)"), Ok(Some(Value::Bool(true))));
+    }
+
+    #[test]
+    fn test_dot_syntax() {
+        assert_eq!(
+            run_prog("(def p (dict :age 25)) p.age"),
+            Ok(Some(Value::Number(25.0)))
+        );
+    }
+
+    #[test]
+    fn test_quote_symbol() {
+        assert_eq!(
+            run_prog("'hello"),
+            Ok(Some(Value::Symbol("hello".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_quote_list() {
+        assert_eq!(
+            run_prog("'(1 2 3)"),
+            Ok(Some(Value::List(vec![
+                std::rc::Rc::new(std::cell::RefCell::new(Value::Number(1.0))),
+                std::rc::Rc::new(std::cell::RefCell::new(Value::Number(2.0))),
+                std::rc::Rc::new(std::cell::RefCell::new(Value::Number(3.0))),
+            ])))
+        );
+    }
+
+    #[test]
+    fn test_quote_list_preserves_symbols() {
+        assert_eq!(
+            run_prog("'(seq-toggle-step 1)"),
+            Ok(Some(Value::List(vec![
+                std::rc::Rc::new(std::cell::RefCell::new(Value::Symbol(
+                    "seq-toggle-step".to_string(),
+                ))),
+                std::rc::Rc::new(std::cell::RefCell::new(Value::Number(1.0))),
+            ])))
+        );
+    }
+
+    #[test]
+    fn test_lisp_printer_for_list() {
+        let value = run_prog("'(1 2 3)").unwrap().unwrap();
+        assert_eq!(format_lisp_value(&value), "(1 2 3)");
+    }
+
+    #[test]
+    fn test_lisp_printer_for_map() {
+        let value = run_prog("(dict :step 1 :active false)").unwrap().unwrap();
+        assert_eq!(format_lisp_value(&value), "{:active false :step 1}");
+    }
+
+    #[test]
+    fn test_list_native() {
+        assert_eq!(
+            run_prog("(list 1 2 3)"),
+            Ok(Some(Value::List(vec![
+                std::rc::Rc::new(std::cell::RefCell::new(Value::Number(1.0))),
+                std::rc::Rc::new(std::cell::RefCell::new(Value::Number(2.0))),
+                std::rc::Rc::new(std::cell::RefCell::new(Value::Number(3.0))),
+            ])))
+        );
+    }
+
+    #[test]
+    fn test_nth_native() {
+        assert_eq!(
+            run_prog("(nth (list 10 20 30) 1)"),
+            Ok(Some(Value::Number(20.0)))
+        );
+    }
+
+    #[test]
+    fn test_range_native() {
+        let value = run_prog("(range 1 4)").unwrap().unwrap();
+        assert_eq!(format_lisp_value(&value), "(1 2 3)");
+    }
+
+    #[test]
+    fn test_rand_int_native_in_range() {
+        let value = run_prog("(rand-int 10 20)").unwrap().unwrap();
+        let Value::Number(n) = value else {
+            panic!("expected number");
+        };
+        assert!((10.0..20.0).contains(&n), "rand-int returned {n}");
+    }
+
+    #[test]
+    fn test_reverse_native() {
+        let value = run_prog("(reverse (list 1 2 3))").unwrap().unwrap();
+        assert_eq!(format_lisp_value(&value), "(3 2 1)");
+    }
+
+    #[test]
+    fn test_str_uses_lisp_printer_for_quoted_list() {
+        let value = run_prog("(str '(seq-toggle-step 1))").unwrap().unwrap();
+        assert_eq!(format_lisp_value(&value), "\"('seq-toggle-step 1)\"");
+    }
+
+    #[test]
+    fn test_lisp_source_for_quoted_list() {
+        let value = run_prog("'(seq-toggle-step 1)").unwrap().unwrap();
+        assert_eq!(format_lisp_source(&value), "(seq-toggle-step 1)");
+    }
+
+    #[test]
+    fn test_source_native_for_quoted_list() {
+        let value = run_prog("(source '(seq-toggle-step 1))").unwrap().unwrap();
+        assert_eq!(format_lisp_value(&value), "\"(seq-toggle-step 1)\"");
+    }
+
+    #[test]
+    fn test_map_filter_reduce_helpers() {
+        let program = r#"
+            (def empty? (xs) (= (len xs) 0))
+            (def map (fn xs)
+              (if (empty? xs)
+                '()
+                (cons (fn (first xs))
+                      (map fn (rest xs)))))
+            (def filter (fn xs)
+              (if (empty? xs)
+                '()
+                (if (fn (first xs))
+                  (cons (first xs) (filter fn (rest xs)))
+                  (filter fn (rest xs)))))
+            (def reduce (fn acc xs)
+              (if (empty? xs)
+                acc
+                (reduce fn (fn acc (first xs)) (rest xs))))
+            (list
+              (map |x| (+ x 1) (list 1 2 3))
+              (filter |x| (> x 1) (list 1 2 3))
+              (reduce |acc x| (+ acc x) 0 (list 1 2 3)))
+        "#;
+        let value = run_prog(program).unwrap().unwrap();
+        assert_eq!(format_lisp_value(&value), "((2 3 4) (2 3) 6)");
+    }
+}

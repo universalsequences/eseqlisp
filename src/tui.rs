@@ -29,11 +29,12 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     let cursor_style = Style::default().bg(Color::White).fg(Color::Black).add_modifier(Modifier::BOLD);
     let match_style  = Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD);
 
-    let text_lines: Vec<Line> = buf
-        .lines
+    let visible = scroll_top..(scroll_top + viewport_height).min(buf.lines.len());
+    let text_lines: Vec<Line> = buf.lines[visible]
         .iter()
         .enumerate()
-        .map(|(row, content)| {
+        .map(|(i, content)| {
+            let row = scroll_top + i;
             let cursor_col = if row == buf.cursor.0 { Some(buf.cursor.1.min(content.len())) } else { None };
             let match_col  = match_pos.and_then(|(mr, mc)| if mr == row { Some(mc) } else { None });
 
@@ -71,13 +72,14 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         .collect();
 
     let text_widget = Paragraph::new(text_lines)
-        .block(Block::default().borders(Borders::ALL).title(buf.name.as_str()))
-        .scroll((scroll_top as u16, 0));
+        .block(Block::default().borders(Borders::ALL).title(buf.name.as_str()));
     frame.render_widget(text_widget, chunks[0]);
 
     // ── Status bar / minibuffer ────────────────────────────────────────────
     let (row, col) = buf.cursor;
-    let status = if let Some(msg) = &editor.minibuffer {
+    let status = if let Some(prompt) = editor.prompt_text() {
+        prompt
+    } else if let Some(msg) = &editor.minibuffer {
         format!(" {msg}")
     } else {
         let dirty = if buf.dirty { "**" } else { "  " };

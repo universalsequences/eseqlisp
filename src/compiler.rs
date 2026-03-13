@@ -60,6 +60,8 @@ pub enum OpCode {
     Return,
     Jump(usize),
     JumpIfFalse(usize),
+    PushBool(bool),
+    PushNil,
 }
 
 pub struct Compiler {
@@ -72,20 +74,20 @@ pub struct Compiler {
 
 fn extract_function_definition(
     list: &[Expression],
-) -> Option<(Option<String>, Vec<Expression>, Expression)> {
-    match (list.first(), list.get(1), list.get(2), list.get(3)) {
+) -> Option<(Option<String>, Vec<Expression>, Vec<Expression>)> {
+    match (list.first(), list.get(1), list.get(2)) {
         (
             Some(Expression::Symbol(s)),
             Some(Expression::Symbol(name)),
             Some(Expression::List(args)),
-            Some(body),
-        ) if s == "def" => Some((Some(name.to_string()), args.clone(), body.clone())),
+        ) if s == "def" && list.len() >= 4 => {
+            Some((Some(name.to_string()), args.clone(), list[3..].to_vec()))
+        }
         (
             Some(Expression::Symbol(s)),
             Some(Expression::List(args)),
-            Some(body),
             _,
-        ) if s == "lambda" => Some((None, args.clone(), body.clone())),
+        ) if s == "lambda" && list.len() >= 3 => Some((None, args.clone(), list[2..].to_vec())),
         _ => None,
     }
 }
@@ -126,6 +128,35 @@ impl Compiler {
             current_chunk: 0,
             global_symbols: existing_global_names,
         }
+    }
+
+    fn compile_quoted_expression(&mut self, expression: &Expression) -> Result<(), CompilerError> {
+        match expression {
+            Expression::List(items) | Expression::QuoteList(items) => {
+                for item in items {
+                    self.compile_quoted_expression(item)?;
+                }
+                self.emit(OpCode::MakeList(items.len()));
+            }
+            Expression::Symbol(s) | Expression::QuoteSymbol(s) => {
+                let idx = self.use_string_constant(s);
+                self.emit(OpCode::PushSymbol(idx));
+            }
+            Expression::Keyword(s) => {
+                let idx = self.use_string_constant(s);
+                self.emit(OpCode::PushKeyword(idx));
+            }
+            Expression::Number(n) => {
+                let constant_idx = self.use_constant(*n);
+                self.emit(OpCode::PushConst(constant_idx));
+            }
+            Expression::String(s) => {
+                let str_idx = self.use_string_constant(s);
+                self.emit(OpCode::PushStr(str_idx));
+            }
+        }
+
+        Ok(())
     }
 
     /// Consume the compiler and return the final global symbol table,
@@ -237,7 +268,7 @@ impl Compiler {
         &mut self,
         name: Option<String>,
         args: Vec<Expression>,
-        body: Expression,
+        body: Vec<Expression>,
     ) -> Result<(), CompilerError> {
         let symbols: Vec<String> = args
             .iter()
@@ -255,7 +286,7 @@ impl Compiler {
             strings: vec![],
             symbols,
         });
-        self.compile_expression(&body)?;
+        self.compile_block(&body)?;
 
         let scope = self.scopes.pop().unwrap();
         self.emit(OpCode::Return);
@@ -302,6 +333,57 @@ impl Compiler {
         Ok(())
     }
 
+    fn compile_block(&mut self, expressions: &[Expression]) -> Result<(), CompilerError> {
+        if expressions.is_empty() {
+            self.emit(OpCode::PushNil);
+            return Ok(());
+        }
+
+        for (idx, expression) in expressions.iter().enumerate() {
+            self.compile_expression(expression)?;
+            if idx + 1 < expressions.len() {
+                self.emit(OpCode::Pop);
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_let_statement(
+        &mut self,
+        bindings_expr: &Expression,
+        body: &[Expression],
+    ) -> Result<(), CompilerError> {
+        let Expression::List(bindings) = bindings_expr else {
+            return Err(CompilerError::InvalidArg);
+        };
+
+        let mut args = Vec::with_capacity(bindings.len());
+        let mut values = Vec::with_capacity(bindings.len());
+
+        for binding in bindings {
+            let Expression::List(pair) = binding else {
+                return Err(CompilerError::InvalidArg);
+            };
+            if pair.len() != 2 {
+                return Err(CompilerError::InvalidArg);
+            }
+
+            let Expression::Symbol(name) = &pair[0] else {
+                return Err(CompilerError::InvalidArg);
+            };
+
+            args.push(Expression::Symbol(name.clone()));
+            values.push(pair[1].clone());
+        }
+
+        for value in values {
+            self.compile_expression(&value)?;
+        }
+        self.compile_function(None, args, body.to_vec())?;
+        self.emit(OpCode::Call(bindings.len()));
+        Ok(())
+    }
+
     pub fn compile_list(&mut self, list: &[Expression]) -> Result<(), CompilerError> {
         if let Some((name, args, body)) = extract_function_definition(list) {
             return self.compile_function(name, args, body);
@@ -317,6 +399,15 @@ impl Compiler {
                 self.compile_expression(expr)?;
                 self.emit(OpCode::Eval);
                 return Ok(());
+            }
+        }
+
+        if let Some(Expression::Symbol(s)) = list.first() {
+            if s == "do" {
+                return self.compile_block(&list[1..]);
+            }
+            if s == "let" && list.len() >= 3 {
+                return self.compile_let_statement(&list[1], &list[2..]);
             }
         }
 
@@ -352,11 +443,10 @@ impl Compiler {
                     }
                     Expression::QuoteList(items) => {
                         for item in items {
-                            self.compile_expression(item)?;
+                            self.compile_quoted_expression(item)?;
                         }
                         self.emit(OpCode::MakeList(items.len()));
                     }
-                    _ => {}
                 }
             }
             let arity = list.len() - 1;
@@ -391,6 +481,18 @@ impl Compiler {
                 self.compile_list(l)?;
             }
             Expression::Symbol(s) => {
+                if s == "true" {
+                    self.emit(OpCode::PushBool(true));
+                    return Ok(());
+                }
+                if s == "false" {
+                    self.emit(OpCode::PushBool(false));
+                    return Ok(());
+                }
+                if s == "nil" {
+                    self.emit(OpCode::PushNil);
+                    return Ok(());
+                }
                 // Dot syntax: person.age  →  load person, GetField("age")
                 // person.address.city  →  load person, GetField("address"), GetField("city")
                 let parts: Vec<&str> = s.splitn(2, '.').collect();
@@ -411,7 +513,7 @@ impl Compiler {
             }
             Expression::Number(n) => {
                 let constant_idx = self.use_constant(*n);
-                self.chunk_mut().unwrap().ops.push(OpCode::PushConst(constant_idx));
+                self.emit(OpCode::PushConst(constant_idx));
             }
             Expression::String(s) => {
                 let str_idx = self.use_string_constant(s);
@@ -423,7 +525,7 @@ impl Compiler {
             }
             Expression::QuoteList(items) => {
                 for item in items {
-                    self.compile_expression(item)?;
+                    self.compile_quoted_expression(item)?;
                 }
                 self.emit(OpCode::MakeList(items.len()));
             }

@@ -2,7 +2,10 @@ use crate::compiler::{Chunk, Compiler, OpCode};
 use crate::parser::{ASTParser, Parser};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::rc::Rc;
+
+static RAND_STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
 #[derive(Debug, PartialEq)]
 pub enum VMError {
@@ -20,6 +23,7 @@ pub type NativeFn = Rc<dyn Fn(Vec<Value>) -> Value>;
 pub enum Value {
     Number(f64),
     Bool(bool),
+    Nil,
     String(String),
     Symbol(String),
     Keyword(String),
@@ -30,20 +34,91 @@ pub enum Value {
     NativeFunction(NativeFn),
 }
 
+pub fn format_lisp_value(value: &Value) -> String {
+    match value {
+        Value::Number(n) => {
+            if n.fract() == 0.0 {
+                format!("{:.0}", n)
+            } else {
+                format!("{n}")
+            }
+        }
+        Value::Bool(b) => b.to_string(),
+        Value::Nil => "nil".to_string(),
+        Value::String(s) => format!("{s:?}"),
+        Value::Symbol(s) => format!("'{s}"),
+        Value::Keyword(s) => format!(":{s}"),
+        Value::List(items) => {
+            let rendered = items
+                .iter()
+                .map(|item| format_lisp_value(&item.borrow()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("({rendered})")
+        }
+        Value::Map(map) => {
+            let mut entries = map
+                .iter()
+                .map(|(key, value)| (key.clone(), format_lisp_value(&value.borrow())))
+                .collect::<Vec<_>>();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let rendered = entries
+                .into_iter()
+                .map(|(key, value)| format!(":{key} {value}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{{{rendered}}}")
+        }
+        Value::Closure(i, _) => format!("<closure:{i}>"),
+        Value::Function(i) => format!("<fn:{i}>"),
+        Value::NativeFunction(_) => "<native>".to_string(),
+    }
+}
+
+pub fn format_lisp_source(value: &Value) -> String {
+    match value {
+        Value::Number(n) => {
+            if n.fract() == 0.0 {
+                format!("{:.0}", n)
+            } else {
+                format!("{n}")
+            }
+        }
+        Value::Bool(b) => b.to_string(),
+        Value::Nil => "nil".to_string(),
+        Value::String(s) => format!("{s:?}"),
+        Value::Symbol(s) => s.clone(),
+        Value::Keyword(s) => format!(":{s}"),
+        Value::List(items) => {
+            let rendered = items
+                .iter()
+                .map(|item| format_lisp_source(&item.borrow()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("({rendered})")
+        }
+        Value::Map(map) => {
+            let mut entries = map
+                .iter()
+                .map(|(key, value)| (key.clone(), format_lisp_source(&value.borrow())))
+                .collect::<Vec<_>>();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let rendered = entries
+                .into_iter()
+                .map(|(key, value)| format!(":{key} {value}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("(dict {rendered})")
+        }
+        Value::Closure(i, _) => format!("<closure:{i}>"),
+        Value::Function(i) => format!("<fn:{i}>"),
+        Value::NativeFunction(_) => "<native>".to_string(),
+    }
+}
+
 impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Number(n) => write!(f, "{n}"),
-            Self::Bool(b) => write!(f, "{b}"),
-            Self::String(s) => write!(f, "{s}"),
-            Self::Symbol(s) => write!(f, "'{s}"),
-            Self::Keyword(s) => write!(f, ":{s}"),
-            Self::List(l) => write!(f, "{l:?}"),
-            Self::Map(m) => write!(f, "{m:?}"),
-            Self::Closure(i, _) => write!(f, "<closure:{i}>"),
-            Self::Function(i) => write!(f, "<fn:{i}>"),
-            Self::NativeFunction(_) => write!(f, "<native>"),
-        }
+        write!(f, "{}", format_lisp_value(self))
     }
 }
 
@@ -52,6 +127,7 @@ impl PartialEq for Value {
         match (self, other) {
             (Self::Number(a), Self::Number(b)) => a == b,
             (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::Nil, Self::Nil) => true,
             (Self::String(a), Self::String(b)) => a == b,
             (Self::Symbol(a), Self::Symbol(b)) => a == b,
             (Self::Keyword(a), Self::Keyword(b)) => a == b,
@@ -71,6 +147,7 @@ impl Clone for Value {
         match self {
             Self::Number(n) => Self::Number(*n),
             Self::Bool(b) => Self::Bool(*b),
+            Self::Nil => Self::Nil,
             Self::String(s) => Self::String(s.clone()),
             Self::Symbol(s) => Self::Symbol(s.clone()),
             Self::Keyword(s) => Self::Keyword(s.clone()),
@@ -115,9 +192,9 @@ pub fn register_core_natives(vm: &mut VM) {
     // (get map :key) → value, or false if missing
     vm.register_native("get", |args| {
         if let (Some(Value::Map(m)), Some(Value::Keyword(k))) = (args.first(), args.get(1)) {
-            m.get(k).map(|v| v.borrow().clone()).unwrap_or(Value::Bool(false))
+            m.get(k).map(|v| v.borrow().clone()).unwrap_or(Value::Nil)
         } else {
-            Value::Bool(false)
+            Value::Nil
         }
     });
 
@@ -147,16 +224,16 @@ pub fn register_core_natives(vm: &mut VM) {
                     .collect(),
             )
         } else {
-            Value::List(vec![])
+            Value::Nil
         }
     });
 
     // (first list) → first element or false
     vm.register_native("first", |args| {
         if let Some(Value::List(l)) = args.first() {
-            l.first().map(|v| v.borrow().clone()).unwrap_or(Value::Bool(false))
+            l.first().map(|v| v.borrow().clone()).unwrap_or(Value::Nil)
         } else {
-            Value::Bool(false)
+            Value::Nil
         }
     });
 
@@ -198,14 +275,116 @@ pub fn register_core_natives(vm: &mut VM) {
         Value::List(result)
     });
 
-    // (not val) → bool
-    vm.register_native("not", |args| {
-        Value::Bool(matches!(args.first(), Some(Value::Bool(false)) | None))
+    // (list a b c) -> List
+    vm.register_native("list", |args| {
+        Value::List(
+            args.into_iter()
+                .map(|value| Rc::new(RefCell::new(value)))
+                .collect(),
+        )
     });
 
-    // (str val ...) → concatenated string representation
+    // (nth list idx) -> value or nil; idx is 0-based
+    vm.register_native("nth", |args| {
+        let (Some(Value::List(list)), Some(Value::Number(idx))) = (args.first(), args.get(1)) else {
+            return Value::Nil;
+        };
+        if *idx < 0.0 {
+            return Value::Nil;
+        }
+        list.get(*idx as usize)
+            .map(|value| value.borrow().clone())
+            .unwrap_or(Value::Nil)
+    });
+
+    // (reverse list) -> reversed list
+    vm.register_native("reverse", |args| {
+        let Some(Value::List(list)) = args.first() else {
+            return Value::List(vec![]);
+        };
+        let mut result = list.clone();
+        result.reverse();
+        Value::List(result)
+    });
+
+    // (range end) or (range start end) -> list of numbers
+    vm.register_native("range", |args| {
+        let (start, end) = match args.as_slice() {
+            [Value::Number(end)] => (0_i64, *end as i64),
+            [Value::Number(start), Value::Number(end)] => (*start as i64, *end as i64),
+            _ => return Value::List(vec![]),
+        };
+
+        let mut values = Vec::new();
+        if start <= end {
+            for n in start..end {
+                values.push(Rc::new(RefCell::new(Value::Number(n as f64))));
+            }
+        } else {
+            for n in (end + 1..=start).rev() {
+                values.push(Rc::new(RefCell::new(Value::Number(n as f64))));
+            }
+        }
+        Value::List(values)
+    });
+
+    // (rand-int end) or (rand-int start end) -> integer in [0,end) or [start,end)
+    vm.register_native("rand-int", |args| {
+        let (start, end) = match args.as_slice() {
+            [Value::Number(end)] => (0_i64, *end as i64),
+            [Value::Number(start), Value::Number(end)] => (*start as i64, *end as i64),
+            _ => return Value::Nil,
+        };
+
+        if end <= start {
+            return Value::Nil;
+        }
+
+        let span = (end - start) as u64;
+        let mut state = RAND_STATE.load(Ordering::Relaxed);
+        loop {
+            let next = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            match RAND_STATE.compare_exchange_weak(
+                state,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    let value = start + (next % span) as i64;
+                    return Value::Number(value as f64);
+                }
+                Err(current) => state = current,
+            }
+        }
+    });
+
+    // (not val) → bool
+    vm.register_native("not", |args| {
+        Value::Bool(matches!(
+            args.first(),
+            Some(Value::Bool(false)) | Some(Value::Nil) | None
+        ))
+    });
+
+    // (str val ...) → concatenated Lisp string representation
     vm.register_native("str", |args| {
-        Value::String(args.iter().map(|v| format!("{v:?}")).collect::<Vec<_>>().join(""))
+        let mut s = String::new();
+        for v in &args {
+            s.push_str(&format_lisp_value(v));
+        }
+        Value::String(s)
+    });
+
+    // (source val ...) → concatenated evaluable Lisp source
+    vm.register_native("source", |args| {
+        let mut s = String::new();
+        for v in &args {
+            s.push_str(&format_lisp_source(v));
+        }
+        Value::String(s)
     });
 }
 
@@ -258,6 +437,14 @@ impl VM {
         idx
     }
 
+    pub fn set_global_value(&mut self, name: &str, value: Value) {
+        let idx = self.ensure_global(name);
+        if idx >= self.globals.len() {
+            self.globals.resize(idx + 1, None);
+        }
+        self.globals[idx] = Some(Rc::new(RefCell::new(value)));
+    }
+
     fn execute_from(&mut self, entry_chunk: usize) -> Result<Option<Value>, VMError> {
         self.current_chunk = entry_chunk;
         self.execute()
@@ -298,6 +485,14 @@ impl VM {
                     } else {
                         return Err(VMError::UnknownConstant);
                     }
+                }
+                OpCode::PushBool(value) => {
+                    stack.push(Rc::new(RefCell::new(Value::Bool(value))));
+                    frames.last_mut().unwrap().pc += 1;
+                }
+                OpCode::PushNil => {
+                    stack.push(Rc::new(RefCell::new(Value::Nil)));
+                    frames.last_mut().unwrap().pc += 1;
                 }
                 OpCode::Add(arity) => {
                     if stack.len() < arity {
@@ -349,6 +544,12 @@ impl VM {
                     stack.push(Rc::new(RefCell::new(Value::Number(product))));
                     frames.last_mut().unwrap().pc += 1;
                 }
+                OpCode::Pop => {
+                    if stack.pop().is_none() {
+                        return Err(VMError::StackUnderflow);
+                    }
+                    frames.last_mut().unwrap().pc += 1;
+                }
                 OpCode::Eq => {
                     if stack.len() < 2 {
                         return Err(VMError::StackUnderflow);
@@ -358,6 +559,7 @@ impl VM {
                         match (&*a.borrow(), &*b.borrow()) {
                             (Value::Number(a), Value::Number(b)) => result = a == b,
                             (Value::Bool(a), Value::Bool(b)) => result = a == b,
+                            (Value::Nil, Value::Nil) => result = true,
                             (Value::String(a), Value::String(b)) => result = a == b,
                             _ => return Err(VMError::IncorrectType),
                         }
@@ -365,56 +567,20 @@ impl VM {
                     stack.push(Rc::new(RefCell::new(Value::Bool(result))));
                     frames.last_mut().unwrap().pc += 1;
                 }
-                OpCode::Lt => {
+                op @ (OpCode::Lt | OpCode::Gt | OpCode::Lte | OpCode::Gte) => {
                     if stack.len() < 2 {
                         return Err(VMError::StackUnderflow);
                     }
                     if let (Some(a), Some(b)) = (stack.pop(), stack.pop()) {
                         match (&*a.borrow(), &*b.borrow()) {
                             (Value::Number(a), Value::Number(b)) => {
-                                stack.push(Rc::new(RefCell::new(Value::Bool(b < a))));
-                            }
-                            _ => return Err(VMError::IncorrectType),
-                        }
-                    }
-                    frames.last_mut().unwrap().pc += 1;
-                }
-                OpCode::Gt => {
-                    if stack.len() < 2 {
-                        return Err(VMError::StackUnderflow);
-                    }
-                    if let (Some(a), Some(b)) = (stack.pop(), stack.pop()) {
-                        match (&*a.borrow(), &*b.borrow()) {
-                            (Value::Number(a), Value::Number(b)) => {
-                                stack.push(Rc::new(RefCell::new(Value::Bool(b > a))));
-                            }
-                            _ => return Err(VMError::IncorrectType),
-                        }
-                    }
-                    frames.last_mut().unwrap().pc += 1;
-                }
-                OpCode::Lte => {
-                    if stack.len() < 2 {
-                        return Err(VMError::StackUnderflow);
-                    }
-                    if let (Some(a), Some(b)) = (stack.pop(), stack.pop()) {
-                        match (&*a.borrow(), &*b.borrow()) {
-                            (Value::Number(a), Value::Number(b)) => {
-                                stack.push(Rc::new(RefCell::new(Value::Bool(b <= a))));
-                            }
-                            _ => return Err(VMError::IncorrectType),
-                        }
-                    }
-                    frames.last_mut().unwrap().pc += 1;
-                }
-                OpCode::Gte => {
-                    if stack.len() < 2 {
-                        return Err(VMError::StackUnderflow);
-                    }
-                    if let (Some(a), Some(b)) = (stack.pop(), stack.pop()) {
-                        match (&*a.borrow(), &*b.borrow()) {
-                            (Value::Number(a), Value::Number(b)) => {
-                                stack.push(Rc::new(RefCell::new(Value::Bool(b >= a))));
+                                let result = match op {
+                                    OpCode::Lt  => b < a,
+                                    OpCode::Gt  => b > a,
+                                    OpCode::Lte => b <= a,
+                                    _           => b >= a,
+                                };
+                                stack.push(Rc::new(RefCell::new(Value::Bool(result))));
                             }
                             _ => return Err(VMError::IncorrectType),
                         }
@@ -444,9 +610,11 @@ impl VM {
                     {
                         let is_false = match &*result.borrow() {
                             Value::Bool(r) => !r,
+                            Value::Nil => true,
                             Value::Number(r) => *r == 0.0,
                             Value::String(r) => r.is_empty(),
-                            _ => return Err(VMError::IncorrectType),
+                            Value::List(r) => r.is_empty(),
+                            _ => false,
                         };
                         if is_false {
                             frame.pc += pc;
@@ -568,7 +736,7 @@ impl VM {
                                 (result, Some(frame)) => {
                                     self.current_chunk = current_chunk;
                                     stack.push(Rc::new(RefCell::new(
-                                        result.unwrap_or(Value::Bool(false)),
+                                        result.unwrap_or(Value::Nil),
                                     )));
                                     frame.pc += 1;
                                 }
@@ -598,7 +766,7 @@ impl VM {
                         Some(val) => {
                             let result = match &*val.borrow() {
                                 Value::Map(m) => m.get(&key).cloned()
-                                    .unwrap_or_else(|| Rc::new(RefCell::new(Value::Bool(false)))),
+                                    .unwrap_or_else(|| Rc::new(RefCell::new(Value::Nil))),
                                 _ => return Err(VMError::IncorrectType),
                             };
                             stack.push(result);

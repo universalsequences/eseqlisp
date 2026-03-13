@@ -90,25 +90,66 @@ impl<'a> SExpParser<'a> {
 /// not on a paren or no match exists.
 pub fn matching_paren(lines: &[String], cursor: (usize, usize)) -> Option<(usize, usize)> {
     let mut cursor = cursor;
-    if let Some(line) = lines.get(cursor.0)
-        && !line.is_empty()
-        && cursor.1 >= line.len()
-    {
+    let line = lines.get(cursor.0)?;
+    if line.is_empty() {
+        return None;
+    }
+    if cursor.1 >= line.len() {
         cursor.1 = line.len() - 1;
     }
 
-    let mut parser = SExpParser::new(lines, cursor);
-    if let Some(ch) = parser.peek()
-        && (ch == '(' || ch == ')')
-    {
-        parser.set_direction(match ch {
-            '(' => Direction::Forward,
-            _ => Direction::Backward,
-        });
-        follow_parens(&mut parser);
-        return Some(parser.position());
+    let chars: Vec<Vec<char>> = lines.iter().map(|line| line.chars().collect()).collect();
+    let start = *chars.get(cursor.0)?.get(cursor.1)?;
+
+    match start {
+        '(' => {
+            let mut depth = 0usize;
+            for (row, line_chars) in chars.iter().enumerate().skip(cursor.0) {
+                let start_col = if row == cursor.0 { cursor.1 } else { 0 };
+                for (col, ch) in line_chars.iter().enumerate().skip(start_col) {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                return Some((row, col));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            None
+        }
+        ')' => {
+            let mut depth = 0usize;
+            for row in (0..=cursor.0).rev() {
+                let line_chars = &chars[row];
+                if line_chars.is_empty() {
+                    continue;
+                }
+                let end_col = if row == cursor.0 {
+                    cursor.1
+                } else {
+                    line_chars.len().saturating_sub(1)
+                };
+                for col in (0..=end_col).rev() {
+                    match line_chars[col] {
+                        ')' => depth += 1,
+                        '(' => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                return Some((row, col));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
     }
-    None
 }
 
 pub fn follow_parens(parser: &mut SExpParser) -> String {
@@ -120,7 +161,7 @@ pub fn follow_parens(parser: &mut SExpParser) -> String {
                 Direction::Forward => {
                     p -= 1;
                     if p <= 0 {
-                        s += &ch.to_string();
+                        s.push(ch);
                         break;
                     }
                 }
@@ -132,7 +173,7 @@ pub fn follow_parens(parser: &mut SExpParser) -> String {
                 Direction::Backward => {
                     p -= 1;
                     if p <= 0 {
-                        s += &ch.to_string();
+                        s.push(ch);
                         break;
                     }
                 }
@@ -142,7 +183,7 @@ pub fn follow_parens(parser: &mut SExpParser) -> String {
             },
             _ => {}
         }
-        s += &ch.to_string();
+        s.push(ch);
         parser.next();
     }
     s
@@ -162,23 +203,63 @@ pub fn follow_parens(parser: &mut SExpParser) -> String {
 ///   - From that '(', scan forwards to the matching ')'.
 ///   - Return the substring from '(' to ')' inclusive.
 pub fn sexp_at_cursor(lines: &[String], cursor: (usize, usize)) -> Option<String> {
-    let mut cursor = cursor;
-    if let Some(line) = lines.get(cursor.0)
-        && !line.is_empty()
-        && cursor.1 >= line.len()
-    {
-        cursor.1 = line.len() - 1;
+    let line = lines.get(cursor.0)?;
+    let cursor_col = cursor.1.min(line.len());
+
+    let mut flat = String::new();
+    let mut line_starts = Vec::with_capacity(lines.len());
+    for (idx, line) in lines.iter().enumerate() {
+        line_starts.push(flat.len());
+        flat.push_str(line);
+        if idx + 1 < lines.len() {
+            flat.push('\n');
+        }
     }
-    let mut parser = SExpParser::new(lines, cursor);
-    _ = follow_parens(&mut parser);
-    parser.set_direction(Direction::Forward);
-    let s = follow_parens(&mut parser);
-    Some(s)
+
+    if flat.is_empty() {
+        return None;
+    }
+
+    let bytes = flat.as_bytes();
+    let cursor_idx = (line_starts[cursor.0] + cursor_col).min(flat.len());
+
+    let mut stack: Vec<usize> = Vec::new();
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for (idx, byte) in bytes.iter().enumerate() {
+        match *byte {
+            b'(' => stack.push(idx),
+            b')' => {
+                if let Some(open) = stack.pop() {
+                    pairs.push((open, idx));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let pair = if cursor_idx < bytes.len() && bytes[cursor_idx] == b'(' {
+        pairs.iter().find(|(open, _)| *open == cursor_idx).copied()
+    } else if cursor_idx > 0 && bytes[cursor_idx - 1] == b')' {
+        pairs.iter().find(|(_, close)| *close == cursor_idx - 1).copied()
+    } else {
+        pairs.iter()
+            .filter(|(open, close)| *open < cursor_idx && cursor_idx <= *close)
+            .min_by_key(|(open, _)| *open)
+            .copied()
+            .or_else(|| {
+                pairs.iter()
+                    .filter(|(_, close)| *close < cursor_idx)
+                    .max_by_key(|(_, close)| *close)
+                    .copied()
+            })
+    }?;
+
+    Some(flat[pair.0..=pair.1].replace('\n', ""))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sexp_at_cursor;
+    use super::{matching_paren, sexp_at_cursor};
 
     #[test]
     fn test_sexp_at_cursor() {
@@ -199,5 +280,40 @@ mod tests {
         let cursor = (1, 5);
         let s = sexp_at_cursor(&lines, cursor);
         assert_eq!(s.unwrap(), "(+ 5 4)", "sexp match");
+    }
+
+    #[test]
+    fn test_sexp_at_end_of_form() {
+        let lines = ["(seq-toggle-step 1)".to_string()];
+        let cursor = (0, lines[0].len());
+        let s = sexp_at_cursor(&lines, cursor);
+        assert_eq!(s.unwrap(), "(seq-toggle-step 1)");
+    }
+
+    #[test]
+    fn test_sexp_at_end_of_form_returns_none_when_no_form_exists() {
+        let lines = ["hello".to_string()];
+        let cursor = (0, lines[0].len());
+        assert_eq!(sexp_at_cursor(&lines, cursor), None);
+    }
+
+    #[test]
+    fn test_sexp_on_opening_paren_prefers_current_form() {
+        let lines = ["(older)".to_string(), "(+ 5 5)".to_string()];
+        let cursor = (1, 0);
+        let s = sexp_at_cursor(&lines, cursor);
+        assert_eq!(s.unwrap(), "(+ 5 5)");
+    }
+
+    #[test]
+    fn matching_paren_returns_none_for_unmatched_open() {
+        let lines = ["(".to_string(), "".to_string()];
+        assert_eq!(matching_paren(&lines, (0, 1)), None);
+    }
+
+    #[test]
+    fn matching_paren_finds_real_match_for_open() {
+        let lines = ["(a".to_string(), ")".to_string()];
+        assert_eq!(matching_paren(&lines, (0, 0)), Some((1, 0)));
     }
 }
